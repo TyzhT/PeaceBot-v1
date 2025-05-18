@@ -1,134 +1,94 @@
 
 import os
-import logging
 import nest_asyncio
 import asyncio
 import yfinance as yf
-import pandas as pd
 import matplotlib.pyplot as plt
 from io import BytesIO
-from telegram import Update, InputFile
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Load environment variables
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+nest_asyncio.apply()
 
-# Logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Variables
 wallet = 100000
-btc = 0.0
-trade_log = []
+portfolio = {}
 
-# Fetch BTC data and calculate RSI
-def fetch_data():
-    df = yf.download("BTC-USD", period="7d", interval="5m")
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    df["RSI"] = rsi
-    return df
+def get_price(symbol):
+    data = yf.download(symbol, period="1d", interval="1m")
+    return float(data['Close'].iloc[-1])
 
-# Strategy: Simple RSI-based buy signal
-def strategy(df):
-    rsi = df["RSI"].iloc[-1]
-    return rsi < 30  # Buy if RSI is oversold
+def plot_portfolio():
+    fig, ax = plt.subplots()
+    symbols = list(portfolio.keys())
+    values = [portfolio[s] * get_price(s) for s in symbols]
+    ax.pie(values, labels=symbols, autopct='%1.1f%%')
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    return buf
 
-# Handle /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 PeaceBot Activated!")
 
-# Handle /portfolio
-async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"💼 Wallet: ₹{wallet:.2f}
-🪙 BTC: {btc:.6f}")
+async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Strategy: RSI 14-day with basic thresholds. Buy < 30, Sell > 70")
 
-# Handle /summary
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_value = wallet + (btc * fetch_data()["Close"].iloc[-1])
-    await update.message.reply_text(
-        f"📊 Portfolio Summary:
-Wallet: ₹{wallet:.2f}
-BTC: {btc:.6f}
-Total Value: ₹{total_value:.2f}"
-    )
+    global wallet
+    value = wallet + sum([portfolio[symbol] * get_price(symbol) for symbol in portfolio])
+    await update.message.reply_text(f"💼 Wallet: ₹{wallet:.2f}\n📈 Total Value: ₹{value:.2f}")
 
-# Handle /chart
-async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = fetch_data()
-    plt.figure(figsize=(10, 5))
-    plt.plot(df["Close"], label="BTC Price")
-    plt.title("BTC Price (7d, 5min)")
-    plt.xlabel("Time")
-    plt.ylabel("Price (USD)")
-    plt.grid(True)
-    buf = BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    await update.message.reply_photo(photo=InputFile(buf, filename="chart.png"))
-
-# Handle /buy
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global wallet, btc
-    df = fetch_data()
-    price = float(df["Close"].iloc[-1])
-    if wallet >= 5000:
-        wallet -= 5000
-        btc_bought = 5000 / price
-        btc += btc_bought
-        trade_log.append(f"BUY ₹5000 @ ${price:.2f}")
-        await update.message.reply_text(f"✅ Bought BTC @ ${price:.2f}")
-    else:
-        await update.message.reply_text("❌ Not enough funds.")
+    global wallet, portfolio
+    try:
+        symbol = context.args[0].upper()
+        quantity = int(context.args[1])
+        price = get_price(symbol)
+        cost = price * quantity
+        if wallet >= cost:
+            wallet -= cost
+            portfolio[symbol] = portfolio.get(symbol, 0) + quantity
+            await update.message.reply_text(f"✅ Bought {quantity} of {symbol} at ₹{price:.2f}")
+        else:
+            await update.message.reply_text("❌ Not enough funds.")
+    except:
+        await update.message.reply_text("❗ Usage: /buy SYMBOL QUANTITY")
 
-# Handle /sell
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global wallet, btc
-    df = fetch_data()
-    price = float(df["Close"].iloc[-1])
-    if btc >= 0.001:
-        btc -= 0.001
-        wallet += price * 0.001
-        trade_log.append(f"SELL 0.001 BTC @ ${price:.2f}")
-        await update.message.reply_text(f"✅ Sold 0.001 BTC @ ${price:.2f}")
-    else:
-        await update.message.reply_text("❌ Not enough BTC.")
+    global wallet, portfolio
+    try:
+        symbol = context.args[0].upper()
+        quantity = int(context.args[1])
+        if portfolio.get(symbol, 0) >= quantity:
+            price = get_price(symbol)
+            wallet += price * quantity
+            portfolio[symbol] -= quantity
+            if portfolio[symbol] == 0:
+                del portfolio[symbol]
+            await update.message.reply_text(f"✅ Sold {quantity} of {symbol} at ₹{price:.2f}")
+        else:
+            await update.message.reply_text("❌ Not enough holdings.")
+    except:
+        await update.message.reply_text("❗ Usage: /sell SYMBOL QUANTITY")
 
-# Handle /log
-async def log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not trade_log:
-        await update.message.reply_text("📭 No trades yet.")
-    else:
-        await update.message.reply_text("
-".join(trade_log))
+async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not portfolio:
+        await update.message.reply_text("📉 Portfolio is empty.")
+        return
+    chart = plot_portfolio()
+    await update.message.reply_photo(photo=chart)
 
-# Run the bot
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("portfolio", portfolio))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("chart", chart))
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("sell", sell))
-    app.add_handler(CommandHandler("log", log))
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("strategy", strategy))
+app.add_handler(CommandHandler("summary", summary))
+app.add_handler(CommandHandler("buy", buy))
+app.add_handler(CommandHandler("sell", sell))
+app.add_handler(CommandHandler("chart", chart))
 
-    logger.info("✅ PeaceBot is running...")
-    await app.run_polling()
-
-nest_asyncio.apply()
-asyncio.run(main())
+print("✅ PeaceBot v1.0 Running")
+app.run_polling()
